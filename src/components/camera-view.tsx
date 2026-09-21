@@ -1,0 +1,370 @@
+'use client'
+
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Aperture, Camera, ImagePlus, Loader2, Images } from 'lucide-react'
+import { resolveNetaFromName } from '@/lib/resolve-neta'
+import type { Neta } from '@/lib/sushi-data'
+import { cn } from '@/lib/utils'
+
+type Phase = 'idle' | 'scanning'
+
+export function CameraView({ onDetect }: { onDetect: (neta: Neta) => void }) {
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const galleryInputRef = useRef<HTMLInputElement>(null)
+  const nativeCameraInputRef = useRef<HTMLInputElement>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const previewUrlRef = useRef<string | null>(null)
+
+  const [phase, setPhase] = useState<Phase>('idle')
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [cameraReady, setCameraReady] = useState(false)
+  const [cameraError, setCameraError] = useState<string | null>(null)
+  const [detectError, setDetectError] = useState<string | null>(null)
+
+  const isScanning = phase === 'scanning'
+
+  const revokePreview = useCallback(() => {
+    if (previewUrlRef.current) {
+      URL.revokeObjectURL(previewUrlRef.current)
+      previewUrlRef.current = null
+    }
+  }, [])
+
+  const stopCamera = useCallback(() => {
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    streamRef.current = null
+    setCameraReady(false)
+  }, [])
+
+  const startCamera = useCallback(async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraError(
+        'ライブプレビューは使えません。「カメラで撮る」または「アルバムから選ぶ」をお使いください。',
+      )
+      return
+    }
+
+    try {
+      setCameraError(null)
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' } },
+        audio: false,
+      })
+
+      streamRef.current = stream
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream
+        await videoRef.current.play()
+      }
+
+      setCameraReady(true)
+    } catch {
+      setCameraError(
+        'カメラの許可がありません。「カメラで撮る」または「アルバムから選ぶ」をお試しください。',
+      )
+    }
+  }, [])
+
+  useEffect(() => {
+    startCamera()
+
+    return () => {
+      stopCamera()
+      revokePreview()
+    }
+  }, [startCamera, stopCamera, revokePreview])
+
+  const identifyImage = async (file: File, preview: string) => {
+    revokePreview()
+    previewUrlRef.current = preview
+    setPreviewUrl(preview)
+    setPhase('scanning')
+    setDetectError(null)
+    stopCamera()
+
+    try {
+      const formData = new FormData()
+      formData.append('image', file)
+
+      const response = await fetch('/api/identify', {
+        method: 'POST',
+        body: formData,
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error ?? '判別に失敗しました。')
+      }
+
+      const neta = resolveNetaFromName(data.name, preview)
+      setPhase('idle')
+      onDetect(neta)
+    } catch (error) {
+      setPhase('idle')
+      setDetectError(
+        error instanceof Error ? error.message : '判別に失敗しました。',
+      )
+      await startCamera()
+    }
+  }
+
+  const captureFromLivePreview = async () => {
+    const video = videoRef.current
+    const canvas = canvasRef.current
+
+    if (!video || !canvas || !cameraReady) {
+      return false
+    }
+
+    if (video.videoWidth === 0 || video.videoHeight === 0) {
+      setDetectError('カメラ映像を取得できません。もう一度お試しください。')
+      return true
+    }
+
+    canvas.width = video.videoWidth
+    canvas.height = video.videoHeight
+
+    const context = canvas.getContext('2d')
+    if (!context) return true
+
+    context.drawImage(video, 0, 0)
+
+    const blob = await new Promise<Blob | null>((resolve) => {
+      canvas.toBlob(resolve, 'image/jpeg', 0.92)
+    })
+
+    if (!blob) {
+      setDetectError('写真の撮影に失敗しました。')
+      return true
+    }
+
+    const file = new File([blob], 'capture.jpg', { type: 'image/jpeg' })
+    const url = URL.createObjectURL(blob)
+    await identifyImage(file, url)
+    return true
+  }
+
+  const handleTakePhoto = async () => {
+    if (isScanning) return
+
+    if (cameraReady) {
+      await captureFromLivePreview()
+      return
+    }
+
+    nativeCameraInputRef.current?.click()
+  }
+
+  const handleFileSelect = async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+
+    const url = URL.createObjectURL(file)
+    await identifyImage(file, url)
+    event.target.value = ''
+  }
+
+  const openGallery = () => {
+    if (isScanning) return
+    galleryInputRef.current?.click()
+  }
+
+  const resetCamera = async () => {
+    revokePreview()
+    setPreviewUrl(null)
+    setDetectError(null)
+    setPhase('idle')
+    await startCamera()
+  }
+
+  return (
+    <div className="flex flex-col items-center px-5 pt-6 pb-2">
+      <div className="mb-5 text-center">
+        <h2 className="font-serif text-xl font-bold tracking-wide text-foreground">
+          ネタにかざす
+        </h2>
+        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+          お皿の一貫を枠に収めて、
+          <br />
+          下のボタンから撮影または写真を選んでください。
+        </p>
+      </div>
+
+      <div className="relative aspect-square w-full max-w-xs overflow-hidden rounded-2xl border border-border bg-black/60">
+        {previewUrl ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={previewUrl}
+            alt="判別する寿司の写真"
+            className={cn(
+              'absolute inset-0 h-full w-full object-cover transition-all duration-700',
+              isScanning
+                ? 'scale-105 brightness-90'
+                : 'scale-100 brightness-75',
+            )}
+          />
+        ) : cameraReady ? (
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            className="absolute inset-0 h-full w-full object-cover"
+          />
+        ) : (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
+            <Images
+              className="size-14 text-muted-foreground/40"
+              strokeWidth={1}
+              aria-hidden="true"
+            />
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              {cameraError ??
+                '下の「カメラで撮る」または「アルバムから選ぶ」で開始できます'}
+            </p>
+          </div>
+        )}
+
+        <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/50 via-transparent to-black/30" />
+
+        {(['left-4 top-4 border-l-2 border-t-2', 'right-4 top-4 border-r-2 border-t-2', 'left-4 bottom-4 border-b-2 border-l-2', 'right-4 bottom-4 border-b-2 border-r-2'] as const).map(
+          (pos) => (
+            <span
+              key={pos}
+              aria-hidden="true"
+              className={cn(
+                'pointer-events-none absolute size-8 rounded-sm border-primary/80',
+                pos,
+              )}
+            />
+          ),
+        )}
+
+        {isScanning && (
+          <>
+            <span
+              aria-hidden="true"
+              className="animate-scanline pointer-events-none absolute inset-x-6 top-6 h-0.5 rounded-full bg-primary shadow-[0_0_14px_2px_var(--color-primary)]"
+            />
+            <div className="pointer-events-none absolute inset-x-0 bottom-4 flex items-center justify-center gap-2 text-primary">
+              <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+              <span className="font-serif text-sm tracking-widest">解析中…</span>
+            </div>
+          </>
+        )}
+      </div>
+
+      <canvas ref={canvasRef} className="hidden" aria-hidden="true" />
+
+      {/* スマホ: capture=environment でカメラアプリ / ギャラリーは accept のみ */}
+      <input
+        ref={nativeCameraInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        className="sr-only"
+        aria-hidden="true"
+        tabIndex={-1}
+        onChange={handleFileSelect}
+      />
+      <input
+        ref={galleryInputRef}
+        type="file"
+        accept="image/*"
+        className="sr-only"
+        aria-hidden="true"
+        tabIndex={-1}
+        onChange={handleFileSelect}
+      />
+
+      <p className="mt-6 w-full max-w-xs text-center font-serif text-xs tracking-widest text-muted-foreground">
+        判別のしかた
+      </p>
+
+      <div className="mt-3 grid w-full max-w-xs grid-cols-2 gap-3">
+        <button
+          type="button"
+          onClick={handleTakePhoto}
+          disabled={isScanning}
+          aria-label="カメラで撮影して判別する"
+          className={cn(
+            'touch-manipulation flex min-h-[52px] flex-col items-center justify-center gap-1.5 rounded-xl border-2 border-primary bg-primary/10 px-3 py-3 transition-transform active:scale-[0.98] disabled:opacity-60',
+          )}
+        >
+          <Camera className="size-6 text-primary" strokeWidth={1.8} aria-hidden="true" />
+          <span className="font-serif text-sm font-semibold text-foreground">
+            カメラで撮る
+          </span>
+          <span className="text-[10px] leading-tight text-muted-foreground">
+            {cameraReady ? 'プレビューから撮影' : 'カメラアプリを起動'}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          onClick={openGallery}
+          disabled={isScanning}
+          aria-label="写真ライブラリから画像を選んで判別する"
+          className={cn(
+            'touch-manipulation flex min-h-[52px] flex-col items-center justify-center gap-1.5 rounded-xl border border-border bg-card px-3 py-3 transition-transform active:scale-[0.98] disabled:opacity-60',
+          )}
+        >
+          <ImagePlus className="size-6 text-primary" strokeWidth={1.8} aria-hidden="true" />
+          <span className="font-serif text-sm font-semibold text-foreground">
+            アルバムから選ぶ
+          </span>
+          <span className="text-[10px] leading-tight text-muted-foreground">
+            保存済みの写真
+          </span>
+        </button>
+      </div>
+
+      {cameraReady && (
+        <button
+          type="button"
+          onClick={handleTakePhoto}
+          disabled={isScanning}
+          aria-label="シャッターボタンで撮影"
+          className="group mt-6 flex flex-col items-center gap-2 disabled:opacity-70"
+        >
+          <span className="relative flex size-[4.5rem] items-center justify-center rounded-full border-2 border-primary/70 transition-transform active:scale-95">
+            <span className="absolute inset-0 rounded-full bg-primary/10 blur-md transition-opacity group-hover:opacity-100" />
+            <span className="flex size-[3.5rem] items-center justify-center rounded-full bg-primary text-primary-foreground shadow-[0_0_24px_-4px_var(--color-primary)]">
+              <Aperture className="size-7" strokeWidth={1.8} aria-hidden="true" />
+            </span>
+          </span>
+          <span className="font-serif text-xs font-semibold tracking-[0.25em] text-muted-foreground">
+            シャッター（プレビュー中）
+          </span>
+        </button>
+      )}
+
+      {detectError && (
+        <div
+          role="alert"
+          className="mt-4 w-full max-w-xs rounded-xl border border-destructive/30 bg-destructive/5 px-4 py-3 text-center text-xs text-destructive"
+        >
+          {detectError}
+          {!cameraReady && (
+            <button
+              type="button"
+              onClick={resetCamera}
+              className="mt-2 block w-full min-h-[44px] text-primary underline-offset-2 hover:underline"
+            >
+              ライブプレビューを再試行
+            </button>
+          )}
+        </div>
+      )}
+
+      <p className="mt-5 text-center text-[11px] leading-relaxed text-muted-foreground/70">
+        スマホでは「カメラで撮る」がカメラ、「アルバムから選ぶ」が写真フォルダを開きます。
+      </p>
+    </div>
+  )
+}

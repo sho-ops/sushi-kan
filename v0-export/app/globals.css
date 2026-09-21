@@ -51,12 +51,14 @@
 
 :root {
   color-scheme: dark;
+  /* Base: near-black with a deep navy undertone */
   --background: oklch(0.16 0.02 265);
   --foreground: oklch(0.94 0.01 90);
   --card: oklch(0.21 0.025 265);
   --card-foreground: oklch(0.94 0.01 90);
   --popover: oklch(0.19 0.025 265);
   --popover-foreground: oklch(0.94 0.01 90);
+  /* Primary: antique gold */
   --primary: oklch(0.78 0.11 85);
   --primary-foreground: oklch(0.18 0.02 265);
   --secondary: oklch(0.27 0.03 265);
@@ -135,3 +137,4 @@
 .animate-stamp-in {
   animation: stampIn 0.5s cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
+
