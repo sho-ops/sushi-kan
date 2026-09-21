@@ -8,6 +8,87 @@ import { cn } from '@/lib/utils'
 
 type Phase = 'idle' | 'scanning'
 
+const VIDEO_CONSTRAINTS_ATTEMPTS: MediaStreamConstraints[] = [
+  { video: { facingMode: 'environment' }, audio: false },
+  { video: { facingMode: { ideal: 'environment' } }, audio: false },
+  { video: { facingMode: 'user' }, audio: false },
+  { video: true, audio: false },
+]
+
+async function acquireCameraStream(): Promise<MediaStream> {
+  let lastError: unknown
+
+  for (const constraints of VIDEO_CONSTRAINTS_ATTEMPTS) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints)
+    } catch (error) {
+      lastError = error
+    }
+  }
+
+  throw lastError ?? new Error('カメラストリームを取得できませんでした')
+}
+
+async function bindStreamToVideo(
+  video: HTMLVideoElement,
+  stream: MediaStream,
+): Promise<void> {
+  video.setAttribute('playsinline', 'true')
+  video.setAttribute('webkit-playsinline', 'true')
+  video.muted = true
+  video.playsInline = true
+  video.autoplay = true
+  video.srcObject = stream
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+
+    const timeoutId = window.setTimeout(() => {
+      if (settled) return
+      settled = true
+      video.removeEventListener('loadedmetadata', onReady)
+      reject(new Error('映像の読み込みがタイムアウトしました'))
+    }, 8000)
+
+    const onReady = () => {
+      if (settled) return
+      settled = true
+      window.clearTimeout(timeoutId)
+      video.removeEventListener('loadedmetadata', onReady)
+      resolve()
+    }
+
+    video.addEventListener('loadedmetadata', onReady)
+
+    if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      onReady()
+    }
+  })
+
+  try {
+    await video.play()
+  } catch {
+    await new Promise((resolve) => window.setTimeout(resolve, 300))
+    await video.play()
+  }
+}
+
+async function waitForVideoFrame(
+  video: HTMLVideoElement,
+  timeoutMs = 4000,
+): Promise<boolean> {
+  const started = Date.now()
+
+  while (Date.now() - started < timeoutMs) {
+    if (video.videoWidth > 0 && video.videoHeight > 0) {
+      return true
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 100))
+  }
+
+  return video.videoWidth > 0 && video.videoHeight > 0
+}
+
 export function CameraView({ onDetect }: { onDetect: (neta: Neta) => void }) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -15,14 +96,17 @@ export function CameraView({ onDetect }: { onDetect: (neta: Neta) => void }) {
   const nativeCameraInputRef = useRef<HTMLInputElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const previewUrlRef = useRef<string | null>(null)
+  const startCameraRequestRef = useRef(0)
 
   const [phase, setPhase] = useState<Phase>('idle')
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [cameraReady, setCameraReady] = useState(false)
+  const [cameraStarting, setCameraStarting] = useState(true)
   const [cameraError, setCameraError] = useState<string | null>(null)
   const [detectError, setDetectError] = useState<string | null>(null)
 
   const isScanning = phase === 'scanning'
+  const showLiveVideo = !previewUrl
 
   const revokePreview = useCallback(() => {
     if (previewUrlRef.current) {
@@ -34,43 +118,80 @@ export function CameraView({ onDetect }: { onDetect: (neta: Neta) => void }) {
   const stopCamera = useCallback(() => {
     streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
+    const video = videoRef.current
+    if (video) {
+      video.srcObject = null
+    }
     setCameraReady(false)
+    setCameraStarting(false)
   }, [])
 
   const startCamera = useCallback(async () => {
+    const requestId = ++startCameraRequestRef.current
+
     if (!navigator.mediaDevices?.getUserMedia) {
       setCameraError(
         'ライブプレビューは使えません。「カメラで撮る」または「アルバムから選ぶ」をお使いください。',
       )
+      setCameraStarting(false)
+      setCameraReady(false)
       return
     }
 
+    setCameraStarting(true)
+    setCameraError(null)
+    setCameraReady(false)
+
+    stopCamera()
+
     try {
-      setCameraError(null)
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' } },
-        audio: false,
-      })
+      const stream = await acquireCameraStream()
+      if (requestId !== startCameraRequestRef.current) {
+        stream.getTracks().forEach((track) => track.stop())
+        return
+      }
 
       streamRef.current = stream
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream
-        await videoRef.current.play()
+      const video = videoRef.current
+      if (!video) {
+        stream.getTracks().forEach((track) => track.stop())
+        streamRef.current = null
+        throw new Error('映像プレビューの準備ができませんでした')
+      }
+
+      await bindStreamToVideo(video, stream)
+
+      if (requestId !== startCameraRequestRef.current) {
+        return
+      }
+
+      const hasFrame = await waitForVideoFrame(video)
+      if (!hasFrame) {
+        throw new Error('カメラ映像のサイズを取得できませんでした')
       }
 
       setCameraReady(true)
     } catch {
+      if (requestId !== startCameraRequestRef.current) {
+        return
+      }
+      stopCamera()
       setCameraError(
-        'カメラの許可がありません。「カメラで撮る」または「アルバムから選ぶ」をお試しください。',
+        'カメラのプレビューを開始できません。「カメラで撮る」（カメラアプリ）または「アルバムから選ぶ」をお試しください。',
       )
+    } finally {
+      if (requestId === startCameraRequestRef.current) {
+        setCameraStarting(false)
+      }
     }
-  }, [])
+  }, [stopCamera])
 
   useEffect(() => {
-    startCamera()
+    void startCamera()
 
     return () => {
+      startCameraRequestRef.current += 1
       stopCamera()
       revokePreview()
     }
@@ -119,9 +240,16 @@ export function CameraView({ onDetect }: { onDetect: (neta: Neta) => void }) {
       return false
     }
 
-    if (video.videoWidth === 0 || video.videoHeight === 0) {
+    const hasFrame = await waitForVideoFrame(video)
+    if (!hasFrame) {
       setDetectError('カメラ映像を取得できません。もう一度お試しください。')
       return true
+    }
+
+    try {
+      await video.play()
+    } catch {
+      // play() は iOS で user gesture 後なら通常成功
     }
 
     canvas.width = video.videoWidth
@@ -208,25 +336,47 @@ export function CameraView({ onDetect }: { onDetect: (neta: Neta) => void }) {
                 : 'scale-100 brightness-75',
             )}
           />
-        ) : cameraReady ? (
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted
-            className="absolute inset-0 h-full w-full object-cover"
-          />
-        ) : (
+        ) : null}
+
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted
+          disablePictureInPicture
+          className={cn(
+            'absolute inset-0 h-full w-full object-cover',
+            !showLiveVideo && 'pointer-events-none opacity-0',
+            showLiveVideo && !cameraReady && 'opacity-0',
+            showLiveVideo && cameraReady && 'opacity-100',
+          )}
+        />
+
+        {showLiveVideo && !cameraReady && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
-            <Images
-              className="size-14 text-muted-foreground/40"
-              strokeWidth={1}
-              aria-hidden="true"
-            />
-            <p className="text-[11px] leading-relaxed text-muted-foreground">
-              {cameraError ??
-                '下の「カメラで撮る」または「アルバムから選ぶ」で開始できます'}
-            </p>
+            {cameraStarting ? (
+              <>
+                <Loader2
+                  className="size-10 animate-spin text-primary"
+                  aria-hidden="true"
+                />
+                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                  カメラを起動しています…
+                </p>
+              </>
+            ) : (
+              <>
+                <Images
+                  className="size-14 text-muted-foreground/40"
+                  strokeWidth={1}
+                  aria-hidden="true"
+                />
+                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                  {cameraError ??
+                    '下の「カメラで撮る」または「アルバムから選ぶ」で開始できます'}
+                </p>
+              </>
+            )}
           </div>
         )}
 
@@ -261,7 +411,6 @@ export function CameraView({ onDetect }: { onDetect: (neta: Neta) => void }) {
 
       <canvas ref={canvasRef} className="hidden" aria-hidden="true" />
 
-      {/* スマホ: capture=environment でカメラアプリ / ギャラリーは accept のみ */}
       <input
         ref={nativeCameraInputRef}
         type="file"
